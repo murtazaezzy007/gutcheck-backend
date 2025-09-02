@@ -2,10 +2,11 @@
   "name": "gutcheck-backend",
   "version": "1.0.0",
   "description": "Backend server for the GutCheck app built with Express and MongoDB. Images are stored on the local file system.",
-  "main": "index.js",
+  "main": "api/index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
   },
   "keywords": [
     "express",
