@@ -1,14 +1,35 @@
 const Meal = require('../models/meal');
-const fs = require('fs');
-const path = require('path');
+const imagekit = require('../lib/imagekit');
 
 /**
- * Create a new meal entry.  Expects the request to be authenticated and
- * `req.user.id` populated by the auth middleware.  The request must include
- * a description in the body and an image file processed by multer.  When
- * using the local disk storage adapter, `req.file.filename` is the name
- * of the uploaded file on disk.  The image URL is constructed
- * relative to the `/uploads/meals` static directory exposed by Express.
+ * Helper: upload one file buffer to ImageKit
+ */
+async function uploadToImageKit({ buffer, originalname, userId }) {
+  const fileName = originalname || `meal_${Date.now()}.jpg`;
+  const folder = `/gutcheck/meals/${userId}`;
+
+  // ImageKit accepts base64 or buffer; buffer is fine
+  const res = await imagekit.upload({
+    file: buffer,
+    fileName,
+    folder,
+    useUniqueFileName: true,
+    // You can add tags, isPrivateFile, etc.
+  });
+
+  // res has: fileId, name, url, thumbnailUrl, filePath, etc.
+  return {
+    url: res.url,
+    key: res.fileId,         // we'll store fileId as "key"
+    name: res.name,
+    path: res.filePath,      // useful if you want to build transformed URLs later
+    size: res.size,
+    mime: res.mime || res.fileType,
+  };
+}
+
+/**
+ * Create a new meal with images uploaded to ImageKit
  */
 async function createMeal(req, res) {
   try {
@@ -17,15 +38,22 @@ async function createMeal(req, res) {
     if (!req.files || req.files.length === 0)
       return res.status(400).json({ message: 'At least one image is required' });
 
-    const imageUrls = req.files.map(file => ({
-      url: `${req.protocol}://${req.get('host')}/uploads/meals/${file.filename}`,
-      key: file.filename,
-    }));
+    const uploads = await Promise.all(
+      req.files.map(f =>
+        uploadToImageKit({
+          buffer: f.buffer,
+          originalname: f.originalname,
+          userId: req.user.id,
+        })
+      )
+    );
 
     const meal = new Meal({
       user: req.user.id,
-      images: imageUrls,
+      images: uploads.map(u => ({ url: u.url, key: u.key })),
       description,
+      // keep legacy single-image field if you need it
+      image: uploads[0] ? { url: uploads[0].url, key: uploads[0].key } : undefined,
     });
 
     await meal.save();
@@ -37,13 +65,11 @@ async function createMeal(req, res) {
 }
 
 /**
- * Get a list of all meals for the authenticated user.  Meals are sorted
- * descending by creation date so that the most recent meals appear first.
+ * Get all meals for the authenticated user
  */
 async function getMeals(req, res) {
   try {
     const meals = await Meal.find({ user: req.user.id }).sort({ createdAt: -1 });
-
     return res.json(meals);
   } catch (err) {
     console.error('Get meals error:', err);
@@ -52,15 +78,13 @@ async function getMeals(req, res) {
 }
 
 /**
- * Get a single meal by id for the authenticated user.
+ * Get a single meal
  */
 async function getMeal(req, res) {
   try {
     const { id } = req.params;
     const meal = await Meal.findOne({ _id: id, user: req.user.id });
-    if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
-    }
+    if (!meal) return res.status(404).json({ message: 'Meal not found' });
     return res.json(meal);
   } catch (err) {
     console.error('Get meal error:', err);
@@ -69,51 +93,49 @@ async function getMeal(req, res) {
 }
 
 /**
- * Update a meal.  Allows updating the description and optionally replacing
- * the associated image.  If a new image is provided, the old image is
- * deleted from the file system before storing the new one.
+ * Update a meal; if new images are provided, delete old ImageKit files and replace
  */
 async function updateMeal(req, res) {
   try {
     const { id } = req.params;
     const meal = await Meal.findOne({ _id: id, user: req.user.id });
-
-    if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
-    }
+    if (!meal) return res.status(404).json({ message: 'Meal not found' });
 
     const { description } = req.body;
-    if (description) {
-      meal.description = description;
-    }
+    if (description) meal.description = description;
 
-    // If multiple images are uploaded
     if (req.files && req.files.length > 0) {
-      // Delete existing images from the filesystem
-      if (meal.images && meal.images.length > 0) {
-        meal.images.forEach((img) => {
-          if (img.key) {
-            const oldPath = path.join(__dirname, '..', 'uploads', 'meals', img.key);
-            fs.unlink(oldPath, (err) => {
-              if (err) {
-                console.error('Error deleting old image:', err);
-              }
-            });
-          }
-        });
+      // Delete all existing images from ImageKit (ignore errors)
+      const keysToDelete = [];
+      if (meal.images?.length) {
+        meal.images.forEach(img => img?.key && keysToDelete.push(img.key));
+      }
+      if (meal.image?.key) {
+        keysToDelete.push(meal.image.key);
       }
 
-      // Build new images array
-      const newImages = req.files.map((file) => ({
-        url: `${req.protocol}://${req.get('host')}/uploads/meals/${file.filename}`,
-        key: file.filename,
-      }));
+      await Promise.all(
+        keysToDelete.map(key =>
+          imagekit.deleteFile(key).catch(err => {
+            console.error('ImageKit delete error (ignored):', err?.message || err);
+          })
+        )
+      );
 
-      meal.images = newImages;
+      // Upload new images
+      const newUploads = await Promise.all(
+        req.files.map(f =>
+          uploadToImageKit({
+            buffer: f.buffer,
+            originalname: f.originalname,
+            userId: req.user.id,
+          })
+        )
+      );
 
-      // Also update legacy single-image field for backward compatibility
-      if (newImages.length > 0) {
-        meal.image = newImages[0];
+      meal.images = newUploads.map(u => ({ url: u.url, key: u.key }));
+      if (newUploads[0]) {
+        meal.image = { url: newUploads[0].url, key: newUploads[0].key };
       }
     }
 
@@ -126,24 +148,31 @@ async function updateMeal(req, res) {
 }
 
 /**
- * Delete a meal and its associated image from the local file system.
+ * Delete a meal and remove associated images from ImageKit
  */
 async function deleteMeal(req, res) {
   try {
     const { id } = req.params;
     const meal = await Meal.findOne({ _id: id, user: req.user.id });
-    if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
+    if (!meal) return res.status(404).json({ message: 'Meal not found' });
+
+    // Collect all fileIds to delete
+    const keysToDelete = [];
+    if (meal.images?.length) {
+      meal.images.forEach(img => img?.key && keysToDelete.push(img.key));
     }
-    // Delete image from the file system if present
-    if (meal.image && meal.image.key) {
-      const filePath = path.join(__dirname, '..', 'uploads', 'meals', meal.image.key);
-      try {
-        await fs.promises.unlink(filePath);
-      } catch (err) {
-        console.error('Error deleting image file:', err);
-      }
+    if (meal.image?.key) {
+      keysToDelete.push(meal.image.key);
     }
+
+    await Promise.all(
+      keysToDelete.map(key =>
+        imagekit.deleteFile(key).catch(err => {
+          console.error('ImageKit delete error (ignored):', err?.message || err);
+        })
+      )
+    );
+
     await meal.deleteOne();
     return res.json({ message: 'Meal deleted' });
   } catch (err) {

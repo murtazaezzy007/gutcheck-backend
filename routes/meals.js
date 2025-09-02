@@ -3,28 +3,22 @@ const router = express.Router();
 const authenticate = require('../middleware/auth');
 const { createMeal, getMeals, getMeal, updateMeal, deleteMeal } = require('../controllers/mealController');
 const multer = require('multer');
-const path = require('path');
 
-// Configure multer with disk storage.  Images are stored in the
-// backend/uploads/meals directory on the local file system.  Each file is
-// given a unique name based on the current timestamp and a random number.
+// In-memory storage for multipart files
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: function (req, file, cb) {
-      cb(null, path.join(__dirname, '..', 'uploads', 'meals'));
-    },
-    filename: function (req, file, cb) {
-      const fileExt = file.originalname.split('.').pop();
-      const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}.${fileExt}`;
-      cb(null, filename);
-    },
-  }),
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 }, // 10MB per file (tweak as needed)
+  fileFilter: (req, file, cb) => {
+    // basic guard; allow images only
+    if (/^image\//.test(file.mimetype)) return cb(null, true);
+    return cb(new Error('Only image uploads are allowed'));
+  },
 });
 
-// Protect all routes below with authentication
+// Protect all routes
 router.use(authenticate);
 
-// Create a meal
+// Create a meal (up to 10 images)
 router.post('/', upload.array('images', 10), createMeal);
 
 // Get all meals for the logged in user
@@ -33,7 +27,7 @@ router.get('/', getMeals);
 // Get a single meal by id
 router.get('/:id', getMeal);
 
-// Update a meal (supports replacing the image)
+// Update a meal (replace images if provided)
 router.post('/:id', upload.array('images', 10), updateMeal);
 
 // Delete a meal
